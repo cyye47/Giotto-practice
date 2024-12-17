@@ -1,0 +1,402 @@
+---
+title: "Visium Part II marker genes"
+author: "Chaoyang Ye"
+date: "2024-08-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("/Users/chaoyangye/Documents/Giotto workshop")
+results_folder <- "/Users/chaoyangye/Documents/Giotto workshop/results/02_session1"
+
+library(Giotto)
+python_path <- "/usr/bin/python3" # need to install igraph, pandas, leidenalg, 
+# continue from day1_sesh5
+visium_brain <- loadGiotto("results/01_session5/visium_brain_object", 
+                           python_path = python_path) # recommended above read.RDS
+pDataDT(visium_brain)
+visium_brain@instructions$save_dir <- results_folder
+
+```
+
+Diff expr
+```{r}
+gini_markers <- findMarkers_one_vs_all(gobject = visium_brain,
+                                       method = "gini", # not all cells in the cluster expression the gene, but highly specific
+                                       expression_values = "normalized",
+                                       cluster_column = "leiden_clus",
+                                       min_feats = 10)
+
+topgenes_gini <- gini_markers[, head(.SD, 2), by = "cluster"]$feats # .SD: subset of data
+
+```
+
+Plot
+```{r}
+violinPlot(visium_brain, 
+           feats = unique(topgenes_gini), 
+           cluster_column = "leiden_clus",
+           strip_text = 6, 
+           strip_position = "right",
+           save_param = list(base_width = 5, base_height = 30))
+
+plotMetaDataHeatmap(visium_brain, 
+                    selected_feats = unique(topgenes_gini),
+                    metadata_cols = "leiden_clus",
+                    x_text_size = 10, y_text_size = 10)
+
+dimFeatPlot2D(visium_brain, 
+              expression_values = "scaled",
+              feats = sort(unique(topgenes_gini)),
+              cow_n_col = 5, 
+              point_size = 1,
+              save_param = list(base_width = 15, base_height = 20))
+
+```
+
+Different method to identify marker genes
+```{r}
+scran_markers <- findMarkers_one_vs_all(gobject = visium_brain,
+                                        method = "scran", # highly expressed in the clusters
+                                        expression_values = "normalized",
+                                        cluster_column = "leiden_clus",
+                                        min_feats = 10)
+
+topgenes_scran <- scran_markers[, head(.SD, 2), by = "cluster"]$feats
+
+violinPlot(visium_brain, 
+           feats = unique(topgenes_scran), 
+           cluster_column = "leiden_clus",
+           strip_text = 6, 
+           strip_position = "right",
+           save_param = list(base_width = 5, base_height = 30))
+plotMetaDataHeatmap(visium_brain, 
+                    selected_feats = unique(topgenes_scran),
+                    metadata_cols = "leiden_clus",
+                    x_text_size = 10, y_text_size = 10)
+dimFeatPlot2D(visium_brain, 
+              expression_values = "scaled",
+              feats = sort(unique(topgenes_scran)),
+              cow_n_col = 5, 
+              point_size = 1,
+              save_param = list(base_width = 20, base_height = 20))
+
+```
+
+can also reference existing signature matrix from single cell RNAseq data generated from another source to determine spot identity
+```{r}
+results_folder <- "results/02_session1"
+
+instructions <- createGiottoInstructions(
+    save_dir = results_folder,
+    save_plot = TRUE,
+    show_plot = FALSE,
+    python_path = python_path
+)
+
+sc_expression <- "data/02_session1/brain_sc_expression_matrix.txt.gz"
+sc_metadata <- "data/02_session1/brain_sc_metadata.csv"
+
+giotto_SC <- createGiottoObject(expression = sc_expression,
+                                instructions = instructions)
+
+giotto_SC <- addCellMetadata(giotto_SC, 
+                             new_metadata = data.table::fread(sc_metadata))
+
+giotto_SC <- normalizeGiotto(giotto_SC)
+
+```
+Identify markers
+```{r}
+markers_scran <- findMarkers_one_vs_all(gobject = giotto_SC, 
+                                        method = "scran",
+                                        expression_values = "normalized",
+                                        cluster_column = "Class", 
+                                        min_feats = 3)
+
+top_markers <- markers_scran[, head(.SD, 10), by = "cluster"]
+celltypes <- levels(factor(markers_scran$cluster)) 
+```
+Create top signature for each cluster
+```{r}
+sign_list <- list()
+
+for (i in 1:length(celltypes)){
+  sign_list[[i]] = top_markers[which(top_markers$cluster == celltypes[i]),]$feats
+}
+
+sign_matrix <- makeSignMatrixPAGE(sign_names = celltypes,
+                                  sign_list = sign_list)
+```
+
+Run enrichment test with PAGE
+```{r}
+visium_brain <- runPAGEEnrich(gobject = visium_brain, 
+                              sign_matrix = sign_matrix)
+```
+
+Visualize
+```{r}
+cell_types_PAGE <- colnames(sign_matrix)
+
+plotMetaDataCellsHeatmap(gobject = visium_brain,
+                         metadata_cols = "leiden_clus",
+                         value_cols = cell_types_PAGE,
+                         spat_enr_names = "PAGE",
+                         x_text_size = 8,
+                         y_text_size = 8)
+
+spatCellPlot2D(gobject = visium_brain,
+               spat_enr_names = "PAGE",
+               cell_annotation_values = cell_types_PAGE,
+               cow_n_col = 3,
+               coord_fix_ratio = 1, 
+               point_size = 1, 
+               show_legend = TRUE)
+```
+
+Spatial DWLS: dampened weighte least squares; estimates proportions of cell types across the tissue
+```{r}
+sign_matrix <- makeSignMatrixDWLSfromMatrix(
+    matrix = getExpression(giotto_SC,
+                           values = "normalized",
+                           output = "matrix"),
+    cell_type = pDataDT(giotto_SC)$Class,
+    sign_gene = top_markers$feats)
+
+visium_brain <- runDWLSDeconv(gobject = visium_brain, 
+                              sign_matrix = sign_matrix) # takes a while
+
+spatDeconvPlot(visium_brain, 
+               show_image = FALSE,
+               radius = 50,
+               save_param = list(save_name = "8_spat_DWLS_pie_plot"))
+```
+
+Spatial expression pattern based on network analysis
+```{r}
+visium_brain <- createSpatialNetwork(gobject = visium_brain,
+                                     method = "kNN", 
+                                     k = 6,
+                                     maximum_distance_knn = 400,
+                                     name = "spatial_network")
+
+spatPlot2D(gobject = visium_brain,  
+           show_network= TRUE,
+           network_color = "blue", 
+           spatial_network_name = "spatial_network")
+```
+
+Rank genes based on if they exhibit the spatial pattern
+```{r}
+ranktest <- binSpect(visium_brain, 
+                     bin_method = "rank",
+                     calc_hub = TRUE, 
+                     hub_min_int = 5,
+                     spatial_network_name = "spatial_network") # takes a few minutes
+
+spatFeatPlot2D(visium_brain, 
+               expression_values = "scaled",
+               feats = ranktest$feats[1:6], 
+               cow_n_col = 2, 
+               point_size = 1)
+
+```
+
+Identify co-expressed genes based on spatial pattern
+```{r}
+ext_spatial_genes <- ranktest[1:500,]$feats
+
+# pairwise distance of top ranked genes
+spat_cor_netw_DT <- detectSpatialCorFeats(
+    visium_brain,
+    method = "network",
+    spatial_network_name = "spatial_network",
+    subset_feats = ext_spatial_genes)
+
+top10_genes <- showSpatialCorFeats(spat_cor_netw_DT, 
+                                  feats = "Mbp", # find co-expressed genes with example gene Mbp
+                                  show_top_feats = 10)
+
+# visualize
+spatFeatPlot2D(visium_brain, 
+               expression_values = "scaled",
+               feats = top10_genes$variable[1:4], 
+               point_size = 1.5)
+
+```
+
+Cluster spacially correlated genes
+```{r}
+spat_cor_netw_DT <- clusterSpatialCorFeats(spat_cor_netw_DT, 
+                                           name = "spat_netw_clus", 
+                                           k = 20)
+heatmSpatialCorFeats(visium_brain,
+                     spatCorObject = spat_cor_netw_DT,
+                     use_clus_name = "spat_netw_clus",
+                     heatmap_legend_param = list(title = NULL))
+```
+
+Rank spatially correlated clusters and the spacially featured genes in each cluster
+```{r}
+netw_ranks <- rankSpatialCorGroups(
+  visium_brain,
+  spatCorObject = spat_cor_netw_DT, 
+  use_clus_name = "spat_netw_clus")
+
+top_netw_spat_cluster <- showSpatialCorFeats(spat_cor_netw_DT, 
+                                            use_clus_name = "spat_netw_clus",
+                                            selected_clusters = 6, 
+                                            show_top_feats = 1)
+```
+
+Metagene enrichment score for each cluster
+```{r}
+cluster_genes_DT <- showSpatialCorFeats(spat_cor_netw_DT, 
+                                        use_clus_name = "spat_netw_clus", 
+                                        show_top_feats = 1)
+
+cluster_genes <- cluster_genes_DT$clus 
+names(cluster_genes) <- cluster_genes_DT$feat_ID
+
+visium_brain <- createMetafeats(visium_brain, 
+                                feat_clusters = cluster_genes, 
+                                name = "cluster_metagene")
+spatCellPlot(visium_brain,
+             spat_enr_names = "cluster_metagene",
+             cell_annotation_values = netw_ranks$clusters,
+             point_size = 1, 
+             cow_n_col = 5)
+
+```
+
+From spatially expressed genes to identify clusters
+```{r}
+coexpr_dt <- data.table::data.table(
+  genes = names(spat_cor_netw_DT$cor_clusters$spat_netw_clus),
+  cluster = spat_cor_netw_DT$cor_clusters$spat_netw_clus)
+
+data.table::setorder(coexpr_dt, cluster)
+
+top30_coexpr_dt <- coexpr_dt[, head(.SD, 30) , by = cluster]
+
+spatial_genes <- top30_coexpr_dt$genes
+
+# similar to previous excercise, but use spatial genes
+visium_brain <- runPCA(gobject = visium_brain,
+                       feats_to_use = spatial_genes,
+                       name = "custom_pca")
+
+visium_brain <- runUMAP(visium_brain, 
+                        dim_reduction_name = "custom_pca", 
+                        dimensions_to_use = 1:20,
+                        name = "custom_umap")
+
+visium_brain <- createNearestNetwork(gobject = visium_brain,
+                                     dim_reduction_name = "custom_pca",
+                                     dimensions_to_use = 1:20, 
+                                     k = 5,
+                                     name = "custom_NN")
+
+visium_brain <- doLeidenCluster(gobject = visium_brain, 
+                                network_name = "custom_NN",
+                                resolution = 0.15, 
+                                n_iterations = 1000,
+                                name = "custom_leiden")
+# visualize
+spatPlot2D(visium_brain, 
+           cell_color = "custom_leiden",
+           point_size = 3)
+plotUMAP(gobject = visium_brain, 
+         cell_color = "custom_leiden")
+
+```
+
+HMRF: hidden markov random field model; another way to identify spatial clusters
+```{r}
+# smfishHmrf python module required
+HMRF_spatial_genes <- doHMRF(gobject = visium_brain,
+                            expression_values = "scaled",
+                            spatial_genes = spatial_genes, 
+                            k = 20,
+                            spatial_network_name = "spatial_network",
+                            betas = c(0, 10, 5),
+                            output_folder = "11_HMRF/") # need java installed and take a while to complete
+visium_brain <- addHMRF(gobject = visium_brain, 
+                        HMRFoutput = HMRF_spatial_genes,
+                        k = 20, 
+                        betas_to_add = c(0, 10, 20, 30, 40),
+                        hmrf_name = "HMRF")
+spatPlot2D(gobject = visium_brain, 
+           cell_color = "HMRF_k20_b.40")
+```
+
+Shiny implementation
+```{r}
+brain_spatPlot <- spatPlot2D(gobject = visium_brain,
+                          cell_color = "leiden_clus",
+                          show_image = FALSE,
+                          return_plot = TRUE,
+                          point_size = 1)
+
+brain_spatPlot
+plotInteractivePolygons(brain_spatPlot)
+
+```
+
+Manual selection and gene expression; a bit clunky
+```{r}
+polygon_coordinates <- plotInteractivePolygons(brain_spatPlot)
+giotto_polygons <- createGiottoPolygonsFromDfr(polygon_coordinates, 
+                                               name = "selections",
+                                               calc_centroids = TRUE)
+visium_brain <- addGiottoPolygons(gobject = visium_brain,
+                                  gpolygons = list(giotto_polygons))
+getCellsFromPolygon(visium_brain,
+                    polygon_name = "selections",
+                    polygons = "polygon 1")
+getCellsFromPolygon(visium_brain,
+                    polygon_name = "selections")
+comparePolygonExpression(visium_brain,
+                         selected_feats = c("Stmn1", "Psd", "Ly6h"))
+scran_results <- findMarkers_one_vs_all(
+  visium_brain,
+  spat_unit = "cell",
+  feat_type = "rna",
+  method = "scran",
+  expression_values = "normalized",
+  cluster_column = "selections",
+  min_feats = 2)
+
+top_genes <- scran_results[, head(.SD, 2), by = "cluster"]$feats
+
+comparePolygonExpression(visium_brain,
+                         selected_feats = top_genes)
+compareCellAbundance(visium_brain)
+compareCellAbundance(visium_brain, 
+                     cell_type_column = "custom_leiden")
+spatPlot2D(visium_brain,
+           cell_color = "leiden_clus",
+           group_by = "selections",
+           cow_n_col = 3,
+           point_size = 2,
+           show_legend = FALSE)
+spatFeatPlot2D(visium_brain,
+               expression_values = "scaled",
+               group_by = "selections",
+               feats = "Psd",
+               point_size = 2)
+plotPolygons(visium_brain,
+             polygon_name = "selections",
+             x = brain_spatPlot)
+```
+
+Save object
+```{r}
+saveGiotto(visium_brain, "results/02_session1/visium_brain_object")
+```
+

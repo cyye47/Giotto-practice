@@ -1,0 +1,122 @@
+---
+title: "Giotto_day1_session5"
+author: "Chaoyang Ye"
+date: "2024-08-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Practice R Giotto package
+```{r}
+library(Giotto)
+# pak::pak("drieslab/GiottoData")
+```
+
+
+```{r, echo=TRUE}
+set.seed(1234)
+
+tx <- data.frame(
+  id = sprintf("gene_%05d", seq(1e4)),
+  x = rnorm(1e4),
+  y = rnorm(1e4),
+  meta = sprintf("metadata_%05d", seq(1e4))
+)
+
+gpoints <- createGiottoPoints(tx)
+
+plot(gpoints, raster = FALSE) # image itself
+plot(gpoints, raster = TRUE) # image into grid of cells with spatial info
+plot(gpoints, dens = TRUE)
+```
+
+
+```{r}
+
+# function to get a filepath from GiottoData
+mini_vis_raw <- function(x) {
+  system.file(
+    package = "GiottoData",
+    file.path("Mini_datasets", "Visium", "Raw", x)
+  )
+}
+
+mini_vis_expr <- mini_vis_raw("visium_DG_expr.txt.gz") |>
+  data.table::fread() |>
+  GiottoUtils::dt_to_matrix()
+
+mini_vis_expr[seq(5), seq(5)]
+```
+
+add spacial info
+```{r}
+mini_vis_slocs <- mini_vis_raw("visium_DG_locs.txt") |>
+  data.table::fread()
+
+head(mini_vis_slocs)
+```
+
+create Giotto object
+```{r}
+mini_vis <- createGiottoObject(
+  expression = mini_vis_expr,
+  spatial_locs = mini_vis_slocs
+)
+
+instructions(mini_vis, "return_plot") <- FALSE
+# set return_plot = FALSE otherwise we will get duplicate outputs in code chunks
+```
+```{r}
+spatFeatPlot2D(mini_vis,
+  feats = c("Gna12", "Gfap"),
+  expression_values = "raw",
+  point_size = 2.5,
+  gradient_style = "sequential",
+  background_color = "black"
+)
+```
+
+example plot
+```{r}
+gpoints <- GiottoData::loadSubObjectMini("giottoPoints")
+
+plot(gpoints)
+
+plot(gpoints, dens = TRUE, col = getColors("magma", 255))
+
+plot(gpoints, raster = FALSE)
+
+plot(gpoints, feats = c("Grm4", "Gfap")) # 2 color, few cells expressing Grm4
+```
+
+subsetting data
+```{r}
+pDataDT(mini_vis)
+getExpression(mini_vis)
+
+instructions(mini_vis, "cell_color_c_pal") <- "viridis"
+
+instructions(mini_vis, "poly_color_c_pal") <- "viridis"
+
+set.seed(1234)
+
+mini_subset <- subsetGiotto(mini_vis, cell_ids = sample(spatIDs(mini_vis), 300))
+
+dim(getExpression(mini_vis))
+dim(getExpression(mini_subset))
+
+```
+
+plot
+```{r}
+spatPlot(mini_vis,
+         background_color = "black")
+
+spatPlot(mini_subset,
+         color_as_factor = FALSE,
+         background_color = "black")
+```
+

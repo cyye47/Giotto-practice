@@ -1,0 +1,339 @@
+---
+title: "Xenium practice"
+author: "Chaoyang Ye"
+date: "2024-08-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Giotto)
+python_path <- "/usr/bin/python3"
+setwd("~/Documents/Giotto workshop")
+data_path <- "data/02_session3"
+save_dir <- "results/02_session3"
+dir.create(save_dir, recursive = TRUE)
+
+```
+
+Create Giotto Xenium object
+```{r}
+g <- createGiottoXeniumObject(xenium_dir = data_path)
+instructions(g, "save_dir") <- save_dir
+instructions(g, "save_plot") <- TRUE
+instructions(g, "python_path") <- python_path
+```
+
+Centroids calculation
+```{r}
+g <- addSpatialCentroidLocations(g, poly_info = "cell")
+g <- addSpatialCentroidLocations(g, poly_info = "nucleus")
+```
+
+Visualization
+```{r}
+spatInSituPlotPoints(g,
+    polygon_feat_type = "cell",
+    feats = list(rna = head(featIDs(g))), # must be named list
+    use_overlap = FALSE, 
+    polygon_color = "cyan", 
+    polygon_line_size = 0.1
+)
+```
+
+Xenium can also be loaded stepwise
+```{r}
+x <- importXenium(data_path)
+
+force(x)
+
+x$qv <- 20 # default
+tx <- x$load_transcripts()
+
+plot(tx[[1]]$rna, dens = TRUE)
+rm(tx)
+```
+
+Image metadata
+```{r}
+img_xml_path <- file.path(data_path, "morphology_focus", "morphology_focus_0000.xml")
+omemeta <- xml2::read_xml(img_xml_path)
+res <- xml2::xml_find_all(omemeta, "//d1:Channel", ns = xml2::xml_ns(omemeta))
+res <- Reduce(rbind, xml2::xml_attrs(res))
+rownames(res) <- NULL
+res <- as.data.frame(res)
+force(res)
+```
+
+Add images
+```{r}
+img_paths <- c(
+    sprintf("data/02_session3/morphology_focus/morphology_focus_%04d.tif", 0:3),
+    "data/02_session3/he_mini.tif"
+)
+
+img_list <- createGiottoLargeImageList(
+    img_paths, 
+    # naming is based on the channel metadata above
+    names = c("DAPI", "18S", "ATP1A1/CD45/E-Cadherin", "alphaSMA/Vimentin", "HE"),
+    use_rast_ext = TRUE,
+    verbose = FALSE
+)
+
+# make some images brighter
+img_list[[1]]@max_window <- 5000
+img_list[[2]]@max_window <- 5000
+img_list[[3]]@max_window <- 5000
+
+# append images to gobject
+g <- setGiotto(g, img_list)
+```
+
+Plots
+```{r}
+# example plots
+spatInSituPlotPoints(g,
+    show_image = TRUE,
+    image_name = "HE",
+    polygon_feat_type = "cell",
+    polygon_color = "cyan",
+    polygon_line_size = 0.1,
+    polygon_alpha = 0
+)
+
+spatInSituPlotPoints(g,
+    show_image = TRUE,
+    image_name = "DAPI",
+    polygon_feat_type = "nucleus",
+    polygon_color = "cyan",
+    polygon_line_size = 0.1,
+    polygon_alpha = 0
+)
+
+spatInSituPlotPoints(g,
+    show_image = TRUE,
+    image_name = "18S",
+    polygon_feat_type = "cell",
+    polygon_color = "cyan",
+    polygon_line_size = 0.1,
+    polygon_alpha = 0
+)
+
+spatInSituPlotPoints(g,
+    show_image = TRUE,
+    image_name = "ATP1A1/CD45/E-Cadherin",
+    polygon_feat_type = "nucleus",
+    polygon_color = "cyan",
+    polygon_line_size = 0.1,
+    polygon_alpha = 0
+)
+```
+
+Aggregate RNA with cell polygons
+```{r}
+g <- calculateOverlap(g,
+    spatial_info = "cell",
+    feat_info = "rna"
+)
+
+g <- overlapToMatrix(g)
+```
+Standard workflow
+```{r}
+g <- addStatistics(g, expression_values = "raw")
+
+# very permissive filtering. Mainly for removing 0 values
+g <- filterGiotto(g,
+    expression_threshold = 1,
+    feat_det_in_min_cells = 1,
+    min_det_feats_per_cell = 5
+)
+
+g <- normalizeGiotto(g)
+# overwrite original results with those for normalized values
+g <- addStatistics(g)
+
+spatInSituPlotPoints(g,
+    polygon_fill = "nr_feats",
+    polygon_fill_gradient_style = "sequential",
+    polygon_fill_as_factor = FALSE
+)
+
+spatInSituPlotPoints(g,
+    polygon_fill = "total_expr",
+    polygon_fill_gradient_style = "sequential",
+    polygon_fill_as_factor = FALSE
+)
+
+g <- runPCA(g, feats_to_use = NULL)
+# feats_to_use = NULL since there are no HVFs calculated. Use all genes.
+
+screePlot(g, ncp = 30)
+
+g <- runUMAP(g, 
+    dimensions_to_use = seq(15), 
+    n_neighbors = 40 # default
+)
+
+plotPCA(g)
+plotUMAP(g)
+
+g <- createNearestNetwork(g,
+    dimensions_to_use = seq(15), 
+    k = 40
+)
+
+# takes roughly 5 min to run
+g <- doLeidenCluster(g)
+
+plotPCA_3D(g, 
+    cell_color = "leiden_clus", 
+    point_size = 1
+)
+
+plotUMAP(g, 
+    cell_color = "leiden_clus", 
+    point_size = 0.1, 
+    point_shape = "no_border"
+)
+
+spatInSituPlotPoints(g,
+    polygon_fill = "leiden_clus",
+    polygon_fill_as_factor = TRUE,
+    polygon_alpha = 0.5,
+    show_image = TRUE,
+    image_name = "HE"
+)
+
+```
+
+Niche clustering
+first generate spatial network
+```{r}
+g <- createSpatialNetwork(g,
+    method = "Delaunay"
+)
+
+spatPlot2D(g, 
+    point_shape = "no_border", 
+    show_network = TRUE, 
+    point_size = 0.1,
+    point_alpha = 0.5,
+    network_color = "grey"
+)
+```
+calculate niche
+```{r}
+g <- calculateSpatCellMetadataProportions(g,
+    spat_network = "Delaunay_network",
+    metadata_column = "leiden_clus", 
+    name = "leiden_niche"
+)
+```
+
+k-means clustering
+```{r}
+# retrieve the niche info
+prop_table <- getSpatialEnrichment(g, 
+    name = "leiden_niche", 
+    output = "data.table")
+
+# convert to matrix
+prop_matrix <- GiottoUtils::dt_to_matrix(prop_table)
+
+# perform kmeans clustering
+set.seed(1234) # make kmeans clustering reproducible
+
+prop_kmeans <- kmeans(
+    x = prop_matrix, 
+    centers = 7, # controls how many clusters will be formed
+    iter.max = 1000,
+    nstart = 100
+)
+
+prop_kmeansDT = data.table::data.table(
+    cell_ID = names(prop_kmeans$cluster),
+    niche = prop_kmeans$cluster
+)
+
+# return kmeans clustering on niche to gobject
+g <- addCellMetadata(g, 
+    new_metadata = prop_kmeansDT, 
+    by_column = TRUE,
+    column_cell_ID = "cell_ID"
+)
+
+# visualize niches
+spatInSituPlotPoints(g,
+    show_image = TRUE,
+    image_name = "HE",
+    polygon_fill = "niche",
+    # polygon_fill_code = getColors("Accent", 8),
+    polygon_alpha = 1,
+    polygon_fill_as_factor = TRUE
+)
+
+# visualize niche makeup by stacked barplot
+cellmeta <- pDataDT(g)
+
+ggplot2::ggplot(
+  cellmeta, ggplot2::aes(fill = as.character(leiden_clus), 
+                         y = 1, 
+                         x = as.character(niche))) + 
+  ggplot2::geom_bar(position = "fill", stat = "identity") + 
+  ggplot2::scale_fill_manual(values = c(
+    "#E7298A", "#FFED6F", "#80B1D3", "#E41A1C", "#377EB8", "#A65628", 
+    "#4DAF4A", "#D9D9D9", "#FF7F00", "#BC80BD", "#666666", "#B3DE69")
+  )
+```
+
+cell proximity between niches
+```{r}
+# uses a lot of memory
+leiden_prox <- cellProximityEnrichment(g,
+    cluster_column = "leiden_clus",
+    spatial_network_name = "Delaunay_network",
+    adjust_method = "fdr",
+    number_of_simulations = 2000
+)
+
+cellProximityBarplot(g,
+    CPscore = leiden_prox,
+    min_orig_ints = 5, # minimum original cell-cell interactions
+    min_sim_ints = 5 # minimum simulated cell-cell interactions
+)
+```
+
+visualize and validate the interesting proximal niches
+```{r}
+# set up colors
+other_cell_color <- rep("grey", 12)
+int_6_8 <- int_2_9 <- other_cell_color
+int_6_8[c(6, 8)] <- c("orange", "cornflowerblue") # hetero interacting niches
+int_2_9[c(2, 9)] <- c("orange", "cornflowerblue")
+
+spatInSituPlotPoints(g,
+    polygon_fill = "leiden_clus",
+    polygon_fill_as_factor = TRUE,
+    polygon_fill_code = int_6_8,
+    polygon_line_size = 0.1,
+    polygon_alpha = 1,
+    show_image = TRUE,
+    image_name = "HE"
+)
+
+spatInSituPlotPoints(g,
+    polygon_fill = "leiden_clus",
+    polygon_fill_as_factor = TRUE,
+    polygon_fill_code = int_2_9,
+    polygon_line_size = 0.1,
+    show_image = TRUE,
+    polygon_alpha = 1,
+    image_name = "HE"
+)
+
+```
+

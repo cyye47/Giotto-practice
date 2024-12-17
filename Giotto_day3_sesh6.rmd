@@ -1,0 +1,335 @@
+---
+title: "Gene expr interpolation with kriging"
+output: github_document
+---
+
+```{r}
+data_directory <- "data/03_session6"
+dir.create(data_directory, showWarnings = F)
+
+download.file(url = "https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Adult_Mouse_Brain/V1_Adult_Mouse_Brain_raw_feature_bc_matrix.tar.gz",
+              destfile = file.path(data_directory, "V1_Adult_Mouse_Brain_raw_feature_bc_matrix.tar.gz"))
+
+download.file(url = "https://cf.10xgenomics.com/samples/spatial-exp/1.1.0/V1_Adult_Mouse_Brain/V1_Adult_Mouse_Brain_spatial.tar.gz",
+              destfile = file.path(data_directory, "V1_Adult_Mouse_Brain_spatial.tar.gz"))
+
+untar(tarfile = file.path(data_directory, "V1_Adult_Mouse_Brain_raw_feature_bc_matrix.tar.gz"), 
+      exdir = data_directory)
+
+untar(tarfile = file.path(data_directory, "V1_Adult_Mouse_Brain_spatial.tar.gz"), 
+      exdir = data_directory)
+
+# nuclei and cell segmentation results
+destfile <- file.path(data_directory, "subcellular_gobject.zip")
+
+options(timeout = Inf) # Needed to download large files
+
+download.file("https://zenodo.org/records/13144556/files/Day3_Session6.zip?download=1", destfile = destfile)
+
+unzip(file.path(data_directory, "subcellular_gobject.zip"), exdir = data_directory)
+```
+
+same process with the data from day1_sesh5
+```{r}
+library(Giotto)
+
+save_directory <- "results/03_session6"
+visium_save_directory <- file.path(save_directory, "visium_mouse_brain")
+subcell_save_directory <- file.path(save_directory, "pseudo_subcellular/")
+
+results_folder <- "/Users/chaoyangye/Documents/Giotto workshop/results/03_session6"
+python_path <- "/usr/bin/python3" # need to install igraph, pandas, leidenalg, 
+# networkx, sklearn, python-louvain modules under python
+
+instructions <- createGiottoInstructions(
+  save_dir = results_folder,
+  save_plot = TRUE,
+  show_plot = FALSE,
+  return_plot = FALSE,
+  python_path = python_path
+)
+
+v_brain <- createGiottoVisiumObject(data_directory, 
+                                    gene_column_index = 2, 
+                                    instructions = instructions)
+
+# Subset to in tissue only
+cm <- pDataDT(v_brain)
+in_tissue_barcodes <- cm[in_tissue == 1]$cell_ID
+v_brain <- subsetGiotto(v_brain, 
+                        cell_ids = in_tissue_barcodes)
+
+# Filter
+v_brain <- filterGiotto(gobject = v_brain,
+                        expression_threshold = 1,
+                        feat_det_in_min_cells = 50,
+                        min_det_feats_per_cell = 1000,
+                        expression_values = "raw")
+
+# Normalize
+v_brain <- normalizeGiotto(gobject = v_brain,
+                           scalefactor = 6000,
+                           verbose = TRUE)
+
+# Add stats
+v_brain <- addStatistics(gobject = v_brain)
+
+# ID HVF
+v_brain <- calculateHVF(gobject = v_brain, 
+                        method = "cov_loess")
+
+fm <- fDataDT(v_brain)
+hv_feats <- fm[hvf == "yes" & perc_cells > 3 & mean_expr_det > 0.4]$feat_ID
+
+# Dimension Reductions
+v_brain <- runPCA(gobject = v_brain,
+                  feats_to_use = hv_feats)
+
+v_brain <- runUMAP(v_brain,
+                   dimensions_to_use = 1:10,
+                   n_neighbors = 15,
+                   set_seed = TRUE)
+
+# NN Network
+v_brain <- createNearestNetwork(gobject = v_brain,
+                                dimensions_to_use = 1:10,
+                                k = 15)
+# Leiden Cluster, takes time
+v_brain <- doLeidenCluster(gobject = v_brain,
+                           resolution = 0.4,
+                           n_iterations = 1000,
+                           set_seed = TRUE)
+
+# Spatial Network (kNN)
+v_brain <- createSpatialNetwork(gobject = v_brain,
+                                method = "kNN",
+                                k = 5,
+                                maximum_distance_knn = 400,
+                                name = "spatial_network")
+
+spatPlot2D(gobject = v_brain,
+           spat_unit = "cell",
+           cell_color = "leiden_clus",
+           show_image = TRUE,
+           point_size = 1.5,
+           point_shape = "no_border",
+           background_color = "black",
+           show_legend = TRUE,
+           save_plot = TRUE,
+           save_param = list(save_name = "03_ses6_1_vis_spat"))
+```
+
+need to identify marker genes demarcating with spatial features using binSpect()
+```{r}
+# Spatially Variable Features
+ranktest <- binSpect(v_brain,
+                     bin_method = "rank",
+                     calc_hub = TRUE,
+                     hub_min_int = 5,
+                     spatial_network_name = "spatial_network",
+                     do_parallel = TRUE,
+                     cores = 8) #not able to provide a seed number, so do not set one
+
+# Getting the top 15 spatially organized genes to save time
+ext_spatial_features <- ranktest[1:15,]$feats
+```
+
+perform kriging to interpolate gene expression
+```{r}
+# raster image for each spatial featured gene
+v_brain <- interpolateFeature(v_brain,
+                                      spat_unit = "cell",
+                                      feat_type = "rna",
+                                      ext = ext(v_brain),
+                                      feats = ext_spatial_features,
+                                      overwrite = TRUE) 
+# data.table installation issue alert
+# auto attached the data.table package
+# may need to run twice
+
+print(v_brain)
+
+# read in cell polygon segmentation file
+# Read in the data
+stardist_cell_poly_path <- file.path(data_directory, "segmentations/stardist_only_cell_bounds.geojson")
+
+stardist_cell_gpoly <- createGiottoPolygonsFromGeoJSON(GeoJSON = stardist_cell_poly_path,
+                                                       name = "stardist_cell",
+                                                       calc_centroids = TRUE)
+
+stardist_cell_gpoly <- flip(stardist_cell_gpoly) # mirror image?
+
+plot(getPolygonInfo(v_brain)) # visium spots max out at 2698
+
+plot(stardist_cell_gpoly, max_poly = 1e6) # polygon from nuclei segmentation hass much finer resolution
+
+print(v_brain) # subcellular info contains only polygon cells
+
+v_brain <- addGiottoPolygons(v_brain, 
+                             gpolygons = list("stardist_cell" = stardist_cell_gpoly))
+
+print(v_brain) # subcellular info contains polygon cells and polygon stardist_cell
+
+poly_info <- getPolygonInfo(v_brain,
+                            polygon_name = "stardist_cell")
+
+print(poly_info)
+```
+
+overlap expression with nuclei polygon images
+takes multiple hours for many genes
+```{r}
+v_brain <- calculateOverlapPolygonImages(gobject = v_brain,
+                                                 name_overlap = "rna",
+                                                 spatial_info = "stardist_cell",
+                                                 image_names = ext_spatial_features)
+
+v_brain <- Giotto::overlapToMatrix(x = v_brain,
+                                           poly_info = "stardist_cell",
+                                           feat_info = "rna",
+                                           aggr_function = "sum",
+                                           type="intensity")
+```
+
+visualize the results from both visium and interpolated data
+```{r}
+v_brain <- filterGiotto(gobject = v_brain,
+                                spat_unit = "stardist_cell",
+                                expression_values = "raw",
+                                expression_threshold = 1,
+                                feat_det_in_min_cells = 0,
+                                min_det_feats_per_cell = 1)
+
+v_brain <- normalizeGiotto(gobject = v_brain,
+                                   spat_unit = "stardist_cell",
+                                   scalefactor = 6000,
+                                   verbose = TRUE)
+spatFeatPlot2D(v_brain,
+               spat_unit = "cell",
+               gradient_style = "sequential",
+               cell_color_gradient = "Geyser",
+               feats = "Sparc",
+               point_size = 2,
+               save_plot = TRUE,
+               show_image = TRUE,
+               save_param = list(save_name = "03_ses6_sparc_vis"))
+
+spatFeatPlot2D(v_brain,
+               spat_unit = "stardist_cell",
+               gradient_style = "sequential",
+               cell_color_gradient = "Geyser",
+               feats = "Sparc",
+               point_size = 0.6,
+               save_plot = TRUE,
+               show_image = TRUE,
+               save_param = list(save_name = "03_ses6_sparc"))
+
+spatFeatPlot2D(v_brain,
+               spat_unit = "cell",
+               gradient_style = "sequential",
+               cell_color_gradient = "Geyser",
+               feats = "Camk2n1",
+               point_size = 2,
+               save_plot = TRUE,
+               show_image = TRUE,
+               save_param = list(save_name = "03_ses6_camk2n1_vis"))
+
+spatFeatPlot2D(v_brain,
+               spat_unit = "stardist_cell",
+               gradient_style = "sequential",
+               cell_color_gradient = "Geyser",
+               feats = "Camk2n1",
+               point_size = 0.6,
+               save_plot = TRUE,
+               show_image = TRUE,
+               save_param = list(save_name = "03_ses6_camk2n1"))
+```
+
+additional clustering analysis using interpolated gene expression
+```{r}
+v_brain <- runPCA(gobject = v_brain,
+                          spat_unit = "stardist_cell",
+                          expression_values = "normalized",
+                          feats_to_use = NULL)
+# UMAP
+v_brain <- runUMAP(v_brain,
+                           spat_unit = "stardist_cell",
+                           dimensions_to_use = 1:15,
+                           n_neighbors = 1000,
+                           min_dist = 0.001,
+                           spread = 1)
+
+# NN Network
+v_brain <- createNearestNetwork(gobject = v_brain,
+                                        spat_unit = "stardist_cell",
+                                        dimensions_to_use = 1:10,
+                                        feats_to_use = hv_feats,
+                                        expression_values = "normalized",
+                                        k = 70)
+
+v_brain <- doLeidenCluster(gobject = v_brain,
+                                   spat_unit = "stardist_cell",
+                                   resolution = 0.15,
+                                   n_iterations = 100,
+                                   partition_type = "RBConfigurationVertexPartition")
+
+plotUMAP(v_brain, 
+         spat_unit = "stardist_cell", 
+         cell_color = "leiden_clus")
+
+spatPlot2D(gobject = v_brain,
+           spat_unit = "cell",
+           cell_color = "leiden_clus",
+           show_image = TRUE,
+           point_size = 0.5,
+           point_shape = "no_border",
+           background_color = "black",
+           save_plot = TRUE,
+           show_legend = TRUE,
+           save_param = list(save_name = "03_ses6_leiden_clust"))
+
+spatPlot2D(gobject = v_brain,
+           spat_unit = "stardist_cell",
+           cell_color = "leiden_clus",
+           show_image = TRUE,
+           point_size = 0.1,
+           point_shape = "no_border",
+           background_color = "black",
+           show_legend = TRUE,
+           save_plot = TRUE,
+           save_param = list(save_name = "03_ses6_subcell_spat"))                  
+```
+
+crop object to zoom into a specific region
+```{r}
+v_brain_crop <- subsetGiottoLocs(gobject = v_brain,
+                                         spat_unit = ":all:",
+                                         x_min = 4000,
+                                         x_max = 7000,
+                                         y_min = -6500,
+                                         y_max = -3500,
+                                         z_max = NULL,
+                                         z_min = NULL)
+
+spatPlot2D(gobject = v_brain_crop,
+           spat_unit = "cell",
+           cell_color = "leiden_clus",
+           show_image = TRUE,
+           point_size = 2,
+           point_shape = "no_border",
+           background_color = "black",
+           show_legend = TRUE,
+           save_plot = TRUE,
+           save_param = list(save_name = "03_ses6_vis_spat_crop"))
+
+spatPlot2D(gobject = v_brain_crop,
+           spat_unit = "stardist_cell",
+           cell_color = "leiden_clus",
+           show_image = TRUE,
+           point_size = 0.1,
+           point_shape = "no_border",
+           background_color = "black",
+           show_legend = TRUE,
+           save_plot = TRUE,
+           save_param = list(save_name = "03_ses6_subcell_spat_crop"))
+```

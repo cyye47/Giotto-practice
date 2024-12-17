@@ -1,0 +1,257 @@
+---
+title: "Multi-modal analysis"
+output: github_document
+---
+
+require spacial alignment of neighboring sections
+```{r}
+library(Giotto)
+instrs <- createGiottoInstructions(save_dir = file.path(getwd(),'/img/03_session2/'),
+                                  save_plot = TRUE,
+                                  show_plot = TRUE)
+options(timeout = 999999)
+download_dir <-file.path(getwd(),'/data/03_session2/')
+destfile <- file.path(download_dir,'Multimodal_registration.zip')
+if (!dir.exists(download_dir)) { dir.create(download_dir, recursive = TRUE) }
+download.file('https://zenodo.org/records/13208139/files/Multimodal_registration.zip?download=1', destfile = destfile)
+unzip(paste0(download_dir,'/Multimodal_registration.zip'), exdir = download_dir)
+Xenium_dir <- paste0(download_dir,'/Xenium/')
+Visium_dir <- paste0(download_dir,'/Visium/')
+```
+
+xenium transcript image representation
+```{r}
+xen_cell_df <- read.csv(paste0(Xenium_dir,"/cells.csv.gz"))
+xen_cell_pl <- ggplot2::ggplot() + 
+ggplot2::geom_point(data = xen_cell_df, ggplot2::aes(x = x_centroid , y = y_centroid),size = 1e-150,,color = 'orange') + 
+ggplot2::theme_classic()
+xen_cell_pl
+```
+
+visium image representation
+```{r}
+G_visium <- createGiottoVisiumObject(visium_dir = Visium_dir,
+                                     gene_column_index = 2,
+                                     png_name = 'tissue_hires_image.png',
+                                     instructions = NULL)
+# In the meantime, calculate statistics for easier plot showing
+G_visium <- normalizeGiotto(G_visium)
+G_visium <- addStatistics(G_visium)
+V_origin <- spatPlot2D(G_visium,show_image = T,point_size = 0,return_plot = T)
+V_origin
+```
+
+transform visium image to align with xenium image
+```{r}
+# create affine2d
+aff <- affine(diag(c(1,1)))
+aff <- aff |> 
+    spin(90) |>
+    flip(direction = "horizontal")
+force(aff)
+
+# Apply the transform
+V_tansformed <- affine(G_visium,aff)
+spatplot_to_register <- spatPlot2D(V_tansformed,show_image = T,point_size = 0,return_plot = T)
+spatplot_to_register
+landmarks <- interactiveLandmarkSelection(spatplot_to_register, xen_cell_pl) # click matching dots
+# here dots are preselected to match
+landmarks<- readRDS(paste0(Xenium_dir,'/Visium_to_Xen_Landmarks.rds'))
+affine_mtx <- calculateAffineMatrixFromLandmarks(landmarks[[1]],landmarks[[2]])
+
+V_final <- affine(G_visium,affine_mtx %*% aff@affine)
+
+spatplot_final <- spatPlot2D(V_final,show_image = T,point_size = 0,show_plot = F) 
+spatplot_final + ggplot2::geom_point(data = xen_cell_df, ggplot2::aes(x = x_centroid , y = y_centroid),size = 1e-150,,color = 'orange') + ggplot2::theme_classic()
+
+```
+
+segment visium image into polygons so it can superimpose onto xenium image
+```{r}
+V_final <- createSpatialNetwork(V_final, k = 1)
+spat_network <- getSpatialNetwork(V_final,output = 'networkDT')
+spatPlot2D(V_final, 
+           show_network = T,
+           network_color = 'blue',
+           point_size = 1)
+center_to_center <- min(spat_network$distance)
+radius <- center_to_center*55/200
+
+Visium_centroid <- getSpatialLocations(V_final,output = 'data.table')
+stamp_dt <- circleVertices(radius = radius, npoints = 100)
+pseudo_visium_dt <- polyStamp(stamp_dt, Visium_centroid)
+pseudo_visium_poly <- createGiottoPolygonsFromDfr(pseudo_visium_dt,calc_centroids = T)
+plot(pseudo_visium_poly)
+
+# xenium gene expression but on visium polygons
+xen_transcripts <- data.table::fread(paste0(Xenium_dir,'/Xen_2_genes.csv.gz'))
+gpoints <- createGiottoPoints(xen_transcripts)
+Xen_obj <-createGiottoObjectSubcellular(gpoints = list('rna' = gpoints),
+                                        gpolygons = list('visium' = pseudo_visium_poly))
+
+Xen_obj <- calculateOverlap(Xen_obj,
+                           feat_info = 'rna',
+                           spatial_info = 'visium')
+
+Xen_obj <- overlapToMatrix(x = Xen_obj,
+                          type = "point", 
+                          poly_info = "visium", 
+                          feat_info = "rna",
+                          aggr_function = "sum")
+
+Xen_obj <- filterGiotto(Xen_obj,
+                        feat_type = 'rna',
+                        spat_unit = 'visium',
+                        expression_threshold = 1, 
+                        feat_det_in_min_cells = 0,
+                        min_det_feats_per_cell = 1)
+tmp_exprs <- getExpression(Xen_obj,
+                       feat_type = 'rna',
+                       spat_unit = 'visium',
+                       output = 'matrix')
+Xen_obj <- setExpression(Xen_obj,
+                         x = createExprObj(log(tmp_exprs+1)),
+                         feat_type = 'rna',
+                         spat_unit = 'visium',
+                         name = 'plot')
+
+spatFeatPlot2D(Xen_obj,
+               point_size = 3.5,
+               expression_values = 'plot',
+               show_image = F,
+               feats = 'ERBB2')
+
+#same gene expression but from visium
+subset_extent <- ext(gpoints@spatVector)
+sub_visium <- subsetGiottoLocs(V_final,
+                               x_min = subset_extent[1],
+                               x_max = subset_extent[2],
+                               y_min = subset_extent[3],
+                               y_max = subset_extent[4])
+spatFeatPlot2D(sub_visium,
+               point_size = 2,
+               expression_values = 'scaled',
+               show_image = F,
+               feats = 'ERBB2')
+```
+
+overlay HE image with IF image from xenium output
+```{r}
+HE_xen <- read10xAffineImage(file = paste0(Xenium_dir, "/HE_ome_compressed.tiff"),
+                           imagealignment_path = paste0(Xenium_dir,"/Xenium_he_imagealignment.csv"),
+                           micron = 0.2125)
+plot(HE_xen)
+
+# rotate
+HE_xen <- HE_xen |> flip(direction = "vertical")
+gimg_rast <- HE_xen@funs$realize_magick(size = prod(dim(HE_xen)))
+plot(gimg_rast)
+
+# overlay
+gg <- ggplot2::ggplot()
+pl <- GiottoVisuals::gg_annotation_raster(gg,gimg_rast)
+pl + ggplot2::geom_smooth() + 
+     ggplot2::geom_point(data = xen_cell_df, ggplot2::aes(x = x_centroid , y = y_centroid),size = 1e-150,,color = 'orange') + ggplot2::theme_classic()
+```
+
+check overlapping expression of two markers
+```{r}
+CD20_gimg <- createGiottoLargeImage(paste0(Xenium_dir,'/CD20_registered.tiff'), use_rast_ext = T,name = 'CD20')
+HER2_gimg <- createGiottoLargeImage(paste0(Xenium_dir,'/HER2_registered.tiff'), use_rast_ext = T,name = 'HER2')
+Xen_obj <- addGiottoLargeImage(gobject = Xen_obj,
+                               largeImages = list('CD20' = CD20_gimg,'HER2' = HER2_gimg))
+
+# cell polygons
+cellpoly_dt <- data.table::fread(paste0(Xenium_dir,'/cell_boundaries.csv.gz'))
+colnames(cellpoly_dt) <- c('poly_ID','x','y')
+cellpoly <- createGiottoPolygonsFromDfr(cellpoly_dt)
+Xen_obj <- addGiottoPolygons(Xen_obj,gpolygons = list('cell' = cellpoly))                      
+
+# expression in polygons
+Xen_obj <- calculateOverlap(Xen_obj,
+                           feat_info = 'rna',
+                           spatial_info = 'cell')
+
+Xen_obj <- overlapToMatrix(x = Xen_obj,
+                          type = "point", 
+                          poly_info = "cell", 
+                          feat_info = "rna",
+                          aggr_function = "sum")
+tmp_exprs <- getExpression(Xen_obj,
+                       feat_type = 'rna',
+                       spat_unit = 'cell',
+                       output = 'matrix')
+Xen_obj <- setExpression(Xen_obj,
+                         x = createExprObj(log(tmp_exprs+1)),
+                         feat_type = 'rna',
+                         spat_unit = 'cell',
+                         name = 'plot')
+spatFeatPlot2D(Xen_obj,
+               feat_type = 'rna',
+               expression_values = 'plot',
+               spat_unit = 'cell',
+               feats = 'ERBB2',
+               point_size = 0.05)
+
+# overlay polygons with image
+Xen_obj <- calculateOverlap(Xen_obj,
+                            spatial_info = 'cell',
+                            image_names = c('HER2','CD20'))
+
+Xen_obj <- overlapToMatrix(x = Xen_obj,
+                          type = "intensity", 
+                          poly_info = "cell", 
+                          feat_info = "protein",
+                          aggr_function = "sum")
+
+tmp_exprs <- getExpression(Xen_obj,
+                       feat_type = 'protein',
+                       spat_unit = 'cell',
+                       output = 'matrix')
+Xen_obj <- setExpression(Xen_obj,
+                         x = createExprObj(log(tmp_exprs+1)),
+                         feat_type = 'protein',
+                         spat_unit = 'cell',
+                         name = 'plot')
+spatFeatPlot2D(Xen_obj,
+               feat_type = 'protein',
+               expression_values = 'plot',
+               spat_unit = 'cell',
+               feats = 'HER2',
+               point_size = 0.05)
+```
+
+back to overlay protein expression onto Visium spatplot_to_register
+```{r}
+Xen_obj <- calculateOverlap(Xen_obj,
+                            spatial_info = 'visium',
+                            image_names = c('HER2','CD20'))
+Xen_obj <- overlapToMatrix(x = Xen_obj,
+                          type = "intensity", 
+                          poly_info = "visium", 
+                          feat_info = "protein",
+                          aggr_function = "sum")
+
+Xen_obj <- filterGiotto(Xen_obj,
+                        feat_type = 'protein',
+                        spat_unit = 'visium',
+                        expression_threshold = 1, 
+                        feat_det_in_min_cells = 0,
+                        min_det_feats_per_cell = 1)
+
+tmp_exprs <- getExpression(Xen_obj,
+                       feat_type = 'protein',
+                       spat_unit = 'visium',
+                       output = 'matrix')
+Xen_obj <- setExpression(Xen_obj,
+                         x = createExprObj(log(tmp_exprs+1)),
+                         feat_type = 'protein',
+                         spat_unit = 'visium',
+                         name = 'plot')
+spatFeatPlot2D(Xen_obj,
+               feat_type = 'protein',
+               expression_values = 'plot',
+               spat_unit = 'visium',
+               feats = 'HER2',
+               point_size = 2)
+```

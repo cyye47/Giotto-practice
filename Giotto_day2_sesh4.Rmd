@@ -1,0 +1,74 @@
+---
+title: "Multiplex IF"
+author: "Chaoyang Ye"
+date: "2024-08-28"
+output: html_document
+---
+
+Need to install Giotto environment with Cellpose for image segmentation
+```{r}
+#Install the Giotto Environment with Cellpose, note that we only need to do it once
+reticulate::conda_create(envname = "giotto_cellpose",
+                         python_version = 3.12)
+
+#.re.restartR()
+reticulate::use_condaenv("giotto_cellpose")
+
+reticulate::py_install(
+  pip = TRUE,
+  envname = "giotto_cellpose",
+  packages = c(
+    "pandas",
+    "networkx",
+    "python-igraph",
+    "leidenalg",
+    "scikit-learn",
+    "cellpose",
+    "smfishhmrf",
+    "tifffile",
+    "scikit-image"
+  )
+)
+```
+# restart R
+
+```{r}
+# Activate the Giotto python environment of your choice
+GiottoClass::set_giotto_python_path("giotto_cellpose")
+
+# Check if cellpose was successfully installed
+GiottoUtils::package_check("cellpose", repository = "pip")
+reticulate::conda_install(envname = 'giotto_env',packages = 'cellpose',pip = TRUE)
+```
+
+download data
+```{r}
+library(Giotto)
+
+instrs <- createGiottoInstructions(save_dir = file.path(getwd(),"/img/02_session4/"),
+                                   save_plot = TRUE,
+                                   show_plot = TRUE,
+                                   python_path = "giotto_cellpose")
+options(timeout = Inf)
+
+data_dir <- "data/02_session4"
+
+destfile <- file.path(data_dir, "Lunaphore.zip")
+
+download.file("https://zenodo.org/records/13175721/files/Lunaphore.zip?download=1", 
+              destfile = destfile)
+
+unzip(file.path(data_dir, "/Lunaphore.zip"), exdir = data_dir)
+
+list.files(file.path(data_dir, "/Lunaphore"))
+```
+
+```{r}
+img_path <- file.path(data_dir, "/Lunaphore/Lunaphore_example.ome.tiff")
+
+img_meta <- ometif_metadata(img_path, 
+                            node = "Channel", 
+                            output = "data.frame")
+
+img_meta
+```
